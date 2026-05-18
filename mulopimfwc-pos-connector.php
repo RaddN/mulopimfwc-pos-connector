@@ -3,7 +3,7 @@
  * Plugin Name: Multi Location POS Connector
  * Plugin URI: https://plugincy.com/multi-location-product-and-inventory-management
  * Description: Connects Multi Location Product & Inventory Management stock and pricing with supported POS systems. OpenPOS is supported in v1.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: plugincy
  * Author URI: https://plugincy.com/
  * Text Domain: mulopimfwc-pos-connector
@@ -29,7 +29,7 @@ if (!defined('MULOPIMFWC_POS_CONNECTOR_URL')) {
 }
 
 if (!defined('MULOPIMFWC_POS_CONNECTOR_VERSION')) {
-    define('MULOPIMFWC_POS_CONNECTOR_VERSION', '1.0.0');
+    define('MULOPIMFWC_POS_CONNECTOR_VERSION', '1.0.1');
 }
 
 require_once MULOPIMFWC_POS_CONNECTOR_DIR . 'includes/class-mulopimfwc-pos-connector.php';

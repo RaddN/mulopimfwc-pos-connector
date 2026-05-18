@@ -409,7 +409,9 @@ class MULOPIMFWC_POS_OpenPOS_Provider
 
     public function filter_product_query_args($args)
     {
-        $warehouse_id = $this->current_query_warehouse_id !== null ? absint($this->current_query_warehouse_id) : 0;
+        $warehouse_id = is_array($args) && isset($args['warehouse_id'])
+            ? absint($args['warehouse_id'])
+            : ($this->current_query_warehouse_id !== null ? absint($this->current_query_warehouse_id) : 0);
         $location_id = $this->get_location_id_for_warehouse($warehouse_id);
 
         if (!$location_id || !is_array($args)) {
@@ -423,13 +425,7 @@ class MULOPIMFWC_POS_OpenPOS_Provider
             }
         }
 
-        $location_tax_query = [
-            'taxonomy' => 'mulopimfwc_store_location',
-            'field' => 'term_id',
-            'terms' => [$location_id],
-            'operator' => 'IN',
-            'include_children' => false,
-        ];
+        $location_tax_query = $this->build_location_tax_query($location_id);
 
         if (empty($args['tax_query']) || !is_array($args['tax_query'])) {
             $args['tax_query'] = [$location_tax_query];
@@ -552,6 +548,7 @@ class MULOPIMFWC_POS_OpenPOS_Provider
         }
 
         $order_item->add_meta_data('_mulopimfwc_location', sanitize_title((string) $item_data['mulopimfwc_location']), true);
+        $order_item->add_meta_data('_store_location', sanitize_title((string) $item_data['mulopimfwc_location']), true);
         $order_item->add_meta_data('_mulopimfwc_pos_location_id', absint($item_data['mulopimfwc_location_id'] ?? 0), true);
     }
 
@@ -584,6 +581,7 @@ class MULOPIMFWC_POS_OpenPOS_Provider
                 $item->update_meta_data('_mulopimfwc_location', (string) $location->slug);
             }
 
+            $item->update_meta_data('_store_location', (string) $location->slug);
             $item->update_meta_data('_mulopimfwc_pos_location_id', (int) $location->term_id);
             $item->update_meta_data('_mulopimfwc_pos_openpos_warehouse', (int) $warehouse_id);
             $item->save();
@@ -632,6 +630,10 @@ class MULOPIMFWC_POS_OpenPOS_Provider
                 continue;
             }
 
+            if (!$this->product_is_assigned_to_location($target_id, (int) $location->term_id)) {
+                continue;
+            }
+
             $quantity = $this->get_order_item_stock_quantity($order, $item);
             if ($quantity <= 0) {
                 continue;
@@ -639,6 +641,7 @@ class MULOPIMFWC_POS_OpenPOS_Provider
 
             $new_stock = $this->apply_location_stock_delta($target_id, (int) $location->term_id, $quantity);
             $item->update_meta_data('_mulopimfwc_location', (string) $location->slug);
+            $item->update_meta_data('_store_location', (string) $location->slug);
             $item->update_meta_data('_mulopimfwc_pos_location_id', (int) $location->term_id);
             $item->update_meta_data('_mulopimfwc_pos_openpos_warehouse', (int) $warehouse_id);
             $item->update_meta_data('_mulopimfwc_pos_stock_reduced', $quantity);
@@ -793,12 +796,7 @@ class MULOPIMFWC_POS_OpenPOS_Provider
                 $payload['stock_quantity'] = $stock;
             }
 
-            $backorders = function_exists('mulopimfwc_get_effective_location_backorders')
-                ? mulopimfwc_get_effective_location_backorders($target_product_id, $location_id)
-                : (method_exists($product, 'get_backorders') ? $product->get_backorders() : 'no');
-            $backorders_allowed = $this->is_location_backorder_enabled() && function_exists('mulopimfwc_is_backorder_allowed')
-                ? mulopimfwc_is_backorder_allowed($backorders)
-                : in_array($backorders, ['yes', 'notify'], true);
+            $backorders_allowed = $this->location_backorders_allowed($target_product_id, $location_id, $product);
 
             $is_in_stock = ($stock === null || $stock > 0 || $backorders_allowed);
             $payload['stock_status'] = $is_in_stock ? 'instock' : 'outofstock';
@@ -847,6 +845,7 @@ class MULOPIMFWC_POS_OpenPOS_Provider
         $price_list = [];
         $regular_price_list = [];
         $total_stock = 0.0;
+        $any_backorders_allowed = false;
 
         foreach ($data['variations'] as $variation_group_index => $variation_group) {
             if (empty($variation_group['options']) || !is_array($variation_group['options'])) {
@@ -866,6 +865,7 @@ class MULOPIMFWC_POS_OpenPOS_Provider
                 $filtered_id_values = [];
                 $prices = [];
                 $stock_qty = 0.0;
+                $option_backorders_allowed = false;
 
                 foreach (array_unique($id_values) as $variation_id) {
                     if ($variation_id <= 0 || !$this->product_is_assigned_to_location($variation_id, $location_id)) {
@@ -881,10 +881,17 @@ class MULOPIMFWC_POS_OpenPOS_Provider
                     $filtered_id_values[] = $variation_id;
 
                     $variation_product = wc_get_product($variation_id);
-                    if ($variation_product && $this->is_location_stock_enabled()) {
-                        $stock = $this->get_location_stock($variation_product, $location_id);
-                        if (is_numeric($stock)) {
-                            $stock_qty += (float) $stock;
+                    if ($variation_product) {
+                        if ($this->is_location_stock_enabled()) {
+                            $stock = $this->get_location_stock($variation_product, $location_id);
+                            if (is_numeric($stock)) {
+                                $stock_qty += (float) $stock;
+                            }
+                        }
+
+                        if ($this->location_backorders_allowed($variation_id, $location_id, $variation_product)) {
+                            $option_backorders_allowed = true;
+                            $any_backorders_allowed = true;
                         }
                     }
 
@@ -915,7 +922,7 @@ class MULOPIMFWC_POS_OpenPOS_Provider
 
                 if ($this->is_location_stock_enabled()) {
                     $data['variations'][$variation_group_index]['options'][$option_index]['stock_qty'] = $stock_qty;
-                    $data['variations'][$variation_group_index]['options'][$option_index]['stock_status'] = $stock_qty > 0 ? 'instock' : 'outofstock';
+                    $data['variations'][$variation_group_index]['options'][$option_index]['stock_status'] = ($stock_qty > 0 || $option_backorders_allowed) ? 'instock' : 'outofstock';
                     $total_stock += $stock_qty;
                 }
             }
@@ -924,7 +931,7 @@ class MULOPIMFWC_POS_OpenPOS_Provider
         if ($this->is_location_stock_enabled()) {
             $data['qty'] = $total_stock;
             $data['stock_quantity'] = $total_stock;
-            $data['stock_status'] = $total_stock > 0 ? 'instock' : 'outofstock';
+            $data['stock_status'] = ($total_stock > 0 || $any_backorders_allowed) ? 'instock' : 'outofstock';
         }
 
         if ($this->is_location_price_enabled() && !empty($price_list)) {
@@ -1038,6 +1045,30 @@ class MULOPIMFWC_POS_OpenPOS_Provider
         return $filtered;
     }
 
+    private function build_location_tax_query(int $location_id): array
+    {
+        $assigned_to_location = [
+            'taxonomy' => 'mulopimfwc_store_location',
+            'field' => 'term_id',
+            'terms' => [$location_id],
+            'operator' => 'IN',
+            'include_children' => false,
+        ];
+
+        if (!$this->is_all_locations_enabled()) {
+            return $assigned_to_location;
+        }
+
+        return [
+            'relation' => 'OR',
+            $assigned_to_location,
+            [
+                'taxonomy' => 'mulopimfwc_store_location',
+                'operator' => 'NOT EXISTS',
+            ],
+        ];
+    }
+
     private function is_location_stock_enabled(): bool
     {
         return $this->is_main_option_enabled('enable_location_stock');
@@ -1051,6 +1082,21 @@ class MULOPIMFWC_POS_OpenPOS_Provider
     private function is_location_backorder_enabled(): bool
     {
         return $this->is_main_option_enabled('enable_location_backorder');
+    }
+
+    private function is_all_locations_enabled(): bool
+    {
+        global $mulopimfwc_options;
+
+        $options = is_array($mulopimfwc_options ?? null)
+            ? $mulopimfwc_options
+            : get_option('mulopimfwc_display_options', []);
+
+        if (function_exists('mulopimfwc_is_all_locations_enabled')) {
+            return mulopimfwc_is_all_locations_enabled($options);
+        }
+
+        return isset($options['enable_all_locations']) && $options['enable_all_locations'] === 'on';
     }
 
     private function is_main_option_enabled(string $key): bool
@@ -1094,18 +1140,53 @@ class MULOPIMFWC_POS_OpenPOS_Provider
             $ids_to_check[] = $parent_id;
         }
 
+        $has_any_location_terms = false;
+
         foreach (array_unique($ids_to_check) as $id) {
             $terms = wp_get_object_terms($id, 'mulopimfwc_store_location', ['fields' => 'ids']);
             if (is_wp_error($terms)) {
                 continue;
             }
 
-            if (in_array($location_id, array_map('intval', $terms), true)) {
-                return true;
+            $terms = array_map('intval', $terms);
+            if (!empty($terms)) {
+                $has_any_location_terms = true;
+            }
+
+            if (in_array($location_id, $terms, true)) {
+                return !$this->is_location_disabled_for_product($product_id, $location_id)
+                    && !$this->is_location_disabled_for_product((int) $id, $location_id);
             }
         }
 
-        return false;
+        return !$has_any_location_terms
+            && $this->is_all_locations_enabled()
+            && !$this->is_location_disabled_for_product($product_id, $location_id);
+    }
+
+    private function is_location_disabled_for_product(int $product_id, int $location_id): bool
+    {
+        if ($product_id <= 0 || $location_id <= 0) {
+            return false;
+        }
+
+        $disabled = get_post_meta($product_id, '_location_disabled_' . $location_id, true);
+        return $disabled !== '' && $disabled !== '0' && $disabled !== 'no' && $disabled !== 'off';
+    }
+
+    private function location_backorders_allowed(int $product_id, int $location_id, $product = null): bool
+    {
+        if (!$product && $product_id > 0) {
+            $product = wc_get_product($product_id);
+        }
+
+        $backorders = $this->is_location_backorder_enabled() && function_exists('mulopimfwc_get_effective_location_backorders')
+            ? mulopimfwc_get_effective_location_backorders($product_id, $location_id)
+            : (is_object($product) && method_exists($product, 'get_backorders') ? $product->get_backorders() : 'no');
+
+        return function_exists('mulopimfwc_is_backorder_allowed')
+            ? mulopimfwc_is_backorder_allowed($backorders)
+            : in_array($backorders, ['yes', 'notify'], true);
     }
 
     private function resolve_product_id($_product, array $data): int
